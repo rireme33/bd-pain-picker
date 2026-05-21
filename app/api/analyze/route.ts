@@ -76,12 +76,11 @@ type RedditListing = {
   };
 };
 
-const USER_AGENT = "bd-reddit-pain-picker/5.3";
+const USER_AGENT = "bd-reddit-pain-picker/5.4";
 
 const RESULT_LIMIT = 10;
 const AI_CANDIDATE_LIMIT = 12;
 const FETCH_TIMEOUT_MS = 9000;
-const MIN_KEEP_SCORE = 7;
 
 const REDDIT_SUBREDDITS = [
   "Entrepreneur",
@@ -119,63 +118,10 @@ const REDDIT_SEARCH_QUERIES = [
   '"agency"',
   '"ads offline"',
   '"no one noticed"',
-];
-
-const OFF_TARGET_TERMS = [
-  "nsfw",
-  "adult",
-  "porn",
-  "xxx",
-  "dick",
-  "urologist",
-  "movie streaming",
-  "dating",
-  "relationship",
-  "loneliness",
-  "stabbed in the back",
-  "co-founder",
-  "cofounder",
-  "intern",
-  "interview",
-  "hr got offended",
-  "unpaid internship",
-];
-
-const WORKFLOW_TERMS = [
-  "manual",
-  "spreadsheet",
-  "tracking",
-  "follow up",
-  "follow-up",
-  "copy paste",
-  "repetitive",
-  "workflow",
-  "admin",
-  "report",
-  "reporting",
-  "client",
-  "lead",
-  "leads",
-  "ads",
-  "campaign",
-  "agency",
-  "account",
-  "updates",
-  "status",
-  "sop",
-  "process",
-  "operations",
-  "not managing",
-  "offline",
-  "missed",
-  "wasted",
-  "hours",
-  "page speed",
-  "pagespeed",
-  "lighthouse",
-  "frontend",
-  "cleanup",
-  "playbook",
+  '"pagespeed"',
+  '"lighthouse"',
+  '"frontend cleanup"',
+  '"playbook"',
 ];
 
 function normalizeWs(value: string) {
@@ -213,53 +159,95 @@ function safeString(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function lowerText(value: string) {
-  return normalizeWs(value).toLowerCase();
+function buildFallbackAnalysis(post: RawRedditPost): AiPainAnalysis {
+  return {
+    usable: true,
+    score: 7,
+    rejectReason: "",
+    targetUser:
+      "Solo founders, operators, marketers, agencies, creators, or small teams",
+    pain:
+      post.title ||
+      "A repeated business workflow is hard to turn into a clear action.",
+    workflowFriction:
+      post.excerpt ||
+      post.title ||
+      "The user is dealing with a messy workflow that needs to be clarified and turned into a repeatable process.",
+    currentBadWorkaround:
+      "They handle it manually with repeated checking, scattered notes, copy-paste, spreadsheets, ad-hoc replies, or one-off AI chats.",
+    whyItMatters:
+      "This wastes time, creates missed opportunities, and makes it hard to turn the signal into a useful product or repeatable workflow.",
+    tinyToolDirection:
+      "A tiny tool that turns the messy source material into a structured workflow brief, reusable checklist, and WILL-ready input.",
+  };
 }
 
-function combinedPostText(post: RawRedditPost) {
-  return lowerText(`${post.title} ${post.excerpt}`);
-}
+function normalizeAnalysis(post: RawRedditPost, analysis: AiPainAnalysis) {
+  const fallback = buildFallbackAnalysis(post);
 
-function isClearlyOffTarget(text: string) {
-  const lower = lowerText(text);
+  analysis.usable = true;
 
-  return OFF_TARGET_TERMS.some((term) =>
-    lower.includes(term.toLowerCase())
-  );
-}
+  if (
+    typeof analysis.score !== "number" ||
+    !Number.isFinite(analysis.score)
+  ) {
+    analysis.score = 7;
+  }
 
-function hasWorkflowSignal(text: string) {
-  const lower = lowerText(text);
+  analysis.targetUser =
+    safeString(analysis.targetUser) ||
+    fallback.targetUser;
 
-  return WORKFLOW_TERMS.some((term) =>
-    lower.includes(term.toLowerCase())
-  );
+  analysis.pain =
+    safeString(analysis.pain) ||
+    safeString(analysis.workflowFriction) ||
+    fallback.pain;
+
+  analysis.workflowFriction =
+    safeString(analysis.workflowFriction) ||
+    safeString(analysis.pain) ||
+    fallback.workflowFriction;
+
+  analysis.currentBadWorkaround =
+    safeString(analysis.currentBadWorkaround) ||
+    fallback.currentBadWorkaround;
+
+  analysis.whyItMatters =
+    safeString(analysis.whyItMatters) ||
+    fallback.whyItMatters;
+
+  analysis.tinyToolDirection =
+    safeString(analysis.tinyToolDirection) ||
+    fallback.tinyToolDirection;
+
+  return analysis;
 }
 
 function buildWillInput(post: RawRedditPost, analysis: AiPainAnalysis) {
+  const normalized = normalizeAnalysis(post, analysis);
+
   const targetUser =
-    safeString(analysis.targetUser) ||
+    safeString(normalized.targetUser) ||
     "Solo founders, operators, agencies, or small teams";
 
   const pain =
-    safeString(analysis.pain) ||
-    safeString(analysis.workflowFriction) ||
+    safeString(normalized.pain) ||
+    safeString(normalized.workflowFriction) ||
     post.title;
 
   const workflowFriction =
-    safeString(analysis.workflowFriction) || pain;
+    safeString(normalized.workflowFriction) || pain;
 
   const currentBadWorkaround =
-    safeString(analysis.currentBadWorkaround) ||
+    safeString(normalized.currentBadWorkaround) ||
     "Manual checking, spreadsheets, repeated copy-paste, ad-hoc follow-up, or messy reporting.";
 
   const whyItMatters =
-    safeString(analysis.whyItMatters) ||
+    safeString(normalized.whyItMatters) ||
     "This wastes time, creates missed opportunities, causes mistakes, or makes the workflow hard to scale.";
 
   const tinyToolDirection =
-    safeString(analysis.tinyToolDirection) ||
+    safeString(normalized.tinyToolDirection) ||
     "A tiny tool that turns this messy workflow into a repeatable output.";
 
   return [
@@ -304,40 +292,51 @@ function extractJsonObject(text: string) {
   return JSON.parse(cleaned.slice(start, end + 1)) as AiPainAnalysis;
 }
 
-function validateAnalysis(post: RawRedditPost, analysis: AiPainAnalysis) {
-  const score =
-    typeof analysis.score === "number"
-      ? analysis.score
-      : Number(analysis.score ?? 0);
+function toPainItem(post: RawRedditPost, analysis: AiPainAnalysis): PainItem {
+  const normalized = normalizeAnalysis(post, analysis);
 
-  const usable = analysis.usable === true;
+  const pain =
+    safeString(normalized.pain) ||
+    safeString(normalized.workflowFriction) ||
+    post.title;
 
-  const rejectReason =
-    safeString(analysis.rejectReason) || "Weak workflow signal.";
+  const workflowFriction =
+    safeString(normalized.workflowFriction) || pain;
 
-  if (!usable) {
-    throw new Error(`Rejected: ${rejectReason}`);
-  }
+  const targetUser =
+    safeString(normalized.targetUser) ||
+    "Solo founders, operators, agencies, creators, or small teams";
 
-  if (!Number.isFinite(score) || score < MIN_KEEP_SCORE) {
-    throw new Error(
-      `Rejected: score ${score || 0} below ${MIN_KEEP_SCORE}. ${rejectReason}`
-    );
-  }
+  const currentBadWorkaround =
+    safeString(normalized.currentBadWorkaround) ||
+    "Manual checking, spreadsheets, repeated copy-paste, ad-hoc follow-up, or messy reporting.";
 
-  const targetUser = safeString(analysis.targetUser);
-  const workflowFriction = safeString(analysis.workflowFriction);
-  const tinyToolDirection = safeString(analysis.tinyToolDirection);
+  const whyItMatters =
+    safeString(normalized.whyItMatters) ||
+    "This wastes time, creates mistakes, and makes the workflow harder to scale.";
 
-  if (!targetUser || !workflowFriction || !tinyToolDirection) {
-    throw new Error(
-      "Rejected: missing targetUser, workflowFriction, or tinyToolDirection."
-    );
-  }
+  const tinyToolDirection =
+    safeString(normalized.tinyToolDirection) ||
+    "A tiny tool that turns this messy workflow into one repeatable output.";
 
-  if (isClearlyOffTarget(combinedPostText(post))) {
-    throw new Error("Rejected: off-target topic.");
-  }
+  return {
+    ...post,
+    keep: true,
+    painQuote: workflowFriction,
+    whoHasPain: targetUser,
+    currentBadWorkaround,
+    whyItHurts: whyItMatters,
+    tinyToolOpportunity: tinyToolDirection,
+    willInput: buildWillInput(post, {
+      ...normalized,
+      targetUser,
+      pain,
+      workflowFriction,
+      currentBadWorkaround,
+      whyItMatters,
+      tinyToolDirection,
+    }),
+  };
 }
 
 async function analyzePostWithAi(post: RawRedditPost): Promise<PainItem> {
@@ -350,28 +349,29 @@ async function analyzePostWithAi(post: RawRedditPost): Promise<PainItem> {
 
   const systemPrompt = [
     "You are BD.",
-    "BD finds real workflow friction that can become a tiny AI/no-code tool.",
+    "BD turns messy market signals into workflow-friction briefs for tiny AI/no-code tools.",
     "",
-    "KEEP only if all are true:",
-    "1. A specific user or buyer has a repeated operational problem.",
-    "2. The pain involves manual work, tracking, reporting, follow-up, checking, spreadsheets, client/account management, marketing ops, sales ops, creator ops, frontend cleanup, or business admin.",
-    "3. There is a bad current workaround.",
-    "4. A solo founder could build a narrow first version within one week.",
-    "5. The output could become a useful tool, lead magnet, micro SaaS, automation, or paid service.",
+    "Do not be too strict.",
+    "Your job is not to reject most posts.",
+    "Your job is to extract the most buildable workflow, even if the source is messy.",
     "",
-    "REJECT if it is mainly:",
-    "- hiring drama",
-    "- founder drama",
-    "- relationship/life advice",
-    "- generic motivation",
-    "- adult/NSFW content",
-    "- medical/health advice",
-    "- pure entertainment",
-    "- a simple project showcase with no workflow pain",
-    "- a viral story that cannot become a narrow operational tool",
+    "Prefer signals involving:",
+    "- manual work",
+    "- repeated checking",
+    "- tracking",
+    "- reporting",
+    "- follow-up",
+    "- marketing ops",
+    "- sales ops",
+    "- creator ops",
+    "- frontend cleanup",
+    "- PageSpeed/Lighthouse cleanup",
+    "- project discovery",
+    "- user acquisition",
+    "- agency/client accountability",
+    "- messy comments or scattered data",
     "",
     "Return JSON only.",
-    "Be strict. Weak signals should be rejected.",
   ].join("\n");
 
   const userPrompt = [
@@ -385,7 +385,7 @@ async function analyzePostWithAi(post: RawRedditPost): Promise<PainItem> {
     "Return JSON in this exact shape:",
     JSON.stringify({
       usable: true,
-      score: 0,
+      score: 7,
       rejectReason: "",
       targetUser: "",
       pain: "",
@@ -395,11 +395,11 @@ async function analyzePostWithAi(post: RawRedditPost): Promise<PainItem> {
       tinyToolDirection: "",
     }),
     "",
-    "Scoring guide:",
-    "9-10 = obvious paid workflow pain with strong tool opportunity.",
-    "7-8 = usable workflow friction with a narrow buildable tool.",
-    "4-6 = interesting but weak, vague, or not clearly monetizable.",
-    "0-3 = off-topic, drama, showcase, entertainment, adult, medical, or not a workflow.",
+    "Rules:",
+    "- Set usable=true unless the source is completely impossible to convert.",
+    "- If the source is weak, still extract a narrow workflow angle.",
+    "- Keep every field short and concrete.",
+    "- Make tinyToolDirection specific enough to build this week.",
   ].join("\n");
 
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -410,8 +410,8 @@ async function analyzePostWithAi(post: RawRedditPost): Promise<PainItem> {
     },
     body: JSON.stringify({
       model,
-      temperature: 0.1,
-      max_tokens: 320,
+      temperature: 0.2,
+      max_tokens: 360,
       response_format: {
         type: "json_object",
       },
@@ -430,7 +430,6 @@ async function analyzePostWithAi(post: RawRedditPost): Promise<PainItem> {
 
   if (!res.ok) {
     const detail = await res.text();
-
     throw new Error(`OpenAI failed: ${res.status} ${detail}`);
   }
 
@@ -438,50 +437,7 @@ async function analyzePostWithAi(post: RawRedditPost): Promise<PainItem> {
   const content = json.choices?.[0]?.message?.content || "";
   const analysis = extractJsonObject(content);
 
-  validateAnalysis(post, analysis);
-
-  const pain =
-    safeString(analysis.pain) ||
-    safeString(analysis.workflowFriction) ||
-    post.title;
-
-  const workflowFriction =
-    safeString(analysis.workflowFriction) || pain;
-
-  const targetUser =
-    safeString(analysis.targetUser) ||
-    "Solo founders, operators, agencies, or small teams";
-
-  const currentBadWorkaround =
-    safeString(analysis.currentBadWorkaround) ||
-    "Manual checking, spreadsheets, repeated copy-paste, ad-hoc follow-up, or messy reporting.";
-
-  const whyItMatters =
-    safeString(analysis.whyItMatters) ||
-    "This wastes time, creates mistakes, and makes the workflow harder to scale.";
-
-  const tinyToolDirection =
-    safeString(analysis.tinyToolDirection) ||
-    "A tiny tool that turns this messy workflow into one repeatable output.";
-
-  return {
-    ...post,
-    keep: true,
-    painQuote: workflowFriction,
-    whoHasPain: targetUser,
-    currentBadWorkaround,
-    whyItHurts: whyItMatters,
-    tinyToolOpportunity: tinyToolDirection,
-    willInput: buildWillInput(post, {
-      ...analysis,
-      targetUser,
-      pain,
-      workflowFriction,
-      currentBadWorkaround,
-      whyItMatters,
-      tinyToolDirection,
-    }),
-  };
+  return toPainItem(post, analysis);
 }
 
 function dedupeByTitle<T extends { title: string }>(items: T[]) {
@@ -533,7 +489,6 @@ function shuffle<T>(items: T[]) {
 
   for (let i = copy.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-
     [copy[i], copy[j]] = [copy[j], copy[i]];
   }
 
@@ -542,11 +497,9 @@ function shuffle<T>(items: T[]) {
 
 async function fetchWithTimeout(url: string, init?: RequestInit) {
   const controller = new AbortController();
-
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   const headers = new Headers(init?.headers);
-
   headers.set("User-Agent", USER_AGENT);
   headers.set("Accept", "application/json,text/plain,*/*");
 
@@ -589,22 +542,22 @@ async function fetchJson<T>(
 function mapRedditPost(post: RedditPostData): RawRedditPost | null {
   const title = normalizeWs(post.title ?? "");
 
-  if (!title || title.length < 12) {
+  if (!title || title.length < 8) {
     return null;
   }
 
   const rawSelftext = normalizeWs(stripHtml(post.selftext ?? ""));
 
   const excerpt = truncate(
-    rawSelftext.length >= 40 ? rawSelftext : title,
+    rawSelftext.length >= 20 ? rawSelftext : title,
     900
   );
 
-  if (!excerpt || excerpt.length < 12) {
+  if (!excerpt || excerpt.length < 8) {
     return null;
   }
 
-  const mapped: RawRedditPost = {
+  return {
     id: post.id
       ? `reddit-${post.id}`
       : Math.random().toString(36).slice(2),
@@ -627,18 +580,6 @@ function mapRedditPost(post: RedditPostData): RawRedditPost | null {
 
     comments: post.num_comments,
   };
-
-  const combined = combinedPostText(mapped);
-
-  if (isClearlyOffTarget(combined)) {
-    return null;
-  }
-
-  if (!hasWorkflowSignal(combined)) {
-    return null;
-  }
-
-  return mapped;
 }
 
 async function fetchRedditUrl(
@@ -646,7 +587,6 @@ async function fetchRedditUrl(
   errors: string[]
 ): Promise<RawRedditPost[]> {
   const json = await fetchJson<RedditListing>(url, errors);
-
   const children = json?.data?.children ?? [];
 
   return children
@@ -700,7 +640,6 @@ async function collectRedditPain(): Promise<AnalyzeResponse> {
     .sort((a, b) => {
       const aComments = a.comments || 0;
       const bComments = b.comments || 0;
-
       return bComments - aComments;
     })
     .slice(0, AI_CANDIDATE_LIMIT);
@@ -713,7 +652,7 @@ async function collectRedditPain(): Promise<AnalyzeResponse> {
     candidates.map(analyzePostWithAi)
   );
 
-  const analyzed = settled.flatMap((result) => {
+  let analyzed = settled.flatMap((result) => {
     if (result.status === "fulfilled") {
       return [result.value];
     }
@@ -727,11 +666,18 @@ async function collectRedditPain(): Promise<AnalyzeResponse> {
     return [];
   });
 
+  if (analyzed.length === 0 && candidates.length > 0) {
+    errors.push("AI produced no cards. Fallback cards were used.");
+
+    analyzed = candidates
+      .slice(0, RESULT_LIMIT)
+      .map((post) => toPainItem(post, buildFallbackAnalysis(post)));
+  }
+
   const items = dedupeByPainQuote(analyzed)
     .sort((a, b) => {
       const aComments = a.comments || 0;
       const bComments = b.comments || 0;
-
       return bComments - aComments;
     })
     .slice(0, RESULT_LIMIT);
@@ -744,11 +690,11 @@ async function collectRedditPain(): Promise<AnalyzeResponse> {
     kept: items.length,
     sources: ["Reddit"],
     pipeline: [
-      "Fetch workflow friction",
-      "Show Reddit fetch errors in debug",
-      "Reject weak or off-target posts",
+      "Fetch Reddit signals",
+      "Keep candidates loosely",
       "Analyze limited candidates with AI",
-      "Package strong signals for WILL",
+      "Use fallback cards if AI produces nothing",
+      "Package results for WILL",
     ],
     debug: {
       redditFetched: posts.length,
@@ -823,10 +769,17 @@ export async function POST(request: Request) {
       );
     }
 
-    const result = await analyzePostWithAi(post);
+    let item: PainItem;
+
+    try {
+      item = await analyzePostWithAi(post);
+    } catch (error) {
+      console.error("BD POST AI failed. Fallback item used:", error);
+      item = toPainItem(post, buildFallbackAnalysis(post));
+    }
 
     return NextResponse.json({
-      item: result,
+      item,
       collected_at: new Date().toISOString(),
     });
   } catch (error) {
