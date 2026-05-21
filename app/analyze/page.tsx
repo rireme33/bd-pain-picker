@@ -34,8 +34,10 @@ type AnalyzeResponse = {
   sources: string[];
   pipeline: string[];
   debug?: {
+    redditAuthEnabled: boolean;
     redditFetched: number;
     afterDedupe: number;
+    aiCandidates: number;
     rejected: number;
     errors?: string[];
   };
@@ -532,7 +534,9 @@ export default function AnalyzePage() {
       ) : null}
 
       {!data ? (
-        <EmptyState />
+        !manualResult ? (
+          <EmptyState />
+        ) : null
       ) : data.items.length === 0 ? (
         <section className="bd-empty bd-warning">
           <h2>

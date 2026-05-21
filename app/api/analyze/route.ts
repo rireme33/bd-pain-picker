@@ -35,6 +35,7 @@ type AnalyzeResponse = {
   sources: string[];
   pipeline: string[];
   debug: {
+    redditAuthEnabled: boolean;
     redditFetched: number;
     afterDedupe: number;
     aiCandidates: number;
@@ -76,11 +77,13 @@ type RedditListing = {
   };
 };
 
-const USER_AGENT = "bd-reddit-pain-picker/5.4";
+const FALLBACK_USER_AGENT = "bd-reddit-pain-picker/5.4";
 
 const RESULT_LIMIT = 10;
 const AI_CANDIDATE_LIMIT = 12;
 const FETCH_TIMEOUT_MS = 9000;
+const REDDIT_SUBREDDIT_LIMIT = 4;
+const REDDIT_SEARCH_LIMIT = 4;
 
 const REDDIT_SUBREDDITS = [
   "Entrepreneur",
@@ -124,6 +127,13 @@ const REDDIT_SEARCH_QUERIES = [
   '"playbook"',
 ];
 
+let redditTokenCache:
+  | {
+      accessToken: string;
+      expiresAt: number;
+    }
+  | null = null;
+
 function normalizeWs(value: string) {
   return value.replace(/\s+/g, " ").trim();
 }
@@ -145,7 +155,7 @@ function truncate(value: string, max = 900) {
   const clean = normalizeWs(value);
 
   return clean.length > max
-    ? `${clean.slice(0, max - 1)}…`
+    ? `${clean.slice(0, max - 1)}...`
     : clean;
 }
 
@@ -253,7 +263,7 @@ function buildWillInput(post: RawRedditPost, analysis: AiPainAnalysis) {
   return [
     "A workflow friction signal was found.",
     "",
-    `Source: r/${post.subreddit} — ${post.title}`,
+    `Source: r/${post.subreddit} - ${post.title}`,
     `URL: ${post.url}`,
     "",
     `Target user: ${targetUser}`,
@@ -500,7 +510,10 @@ async function fetchWithTimeout(url: string, init?: RequestInit) {
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   const headers = new Headers(init?.headers);
-  headers.set("User-Agent", USER_AGENT);
+  headers.set(
+    "User-Agent",
+    process.env.REDDIT_USER_AGENT || FALLBACK_USER_AGENT
+  );
   headers.set("Accept", "application/json,text/plain,*/*");
 
   try {
@@ -515,12 +528,85 @@ async function fetchWithTimeout(url: string, init?: RequestInit) {
   }
 }
 
+function getRedditOAuthConfig() {
+  const clientId = process.env.REDDIT_CLIENT_ID?.trim();
+  const clientSecret = process.env.REDDIT_CLIENT_SECRET?.trim();
+  const userAgent =
+    process.env.REDDIT_USER_AGENT?.trim() || FALLBACK_USER_AGENT;
+
+  if (!clientId || !clientSecret) {
+    throw new Error(
+      "Reddit OAuth env vars are missing. Add REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET in Vercel."
+    );
+  }
+
+  return { clientId, clientSecret, userAgent };
+}
+
+async function getRedditAccessToken() {
+  const now = Date.now();
+
+  if (
+    redditTokenCache?.accessToken &&
+    redditTokenCache.expiresAt > now
+  ) {
+    return redditTokenCache.accessToken;
+  }
+
+  const { clientId, clientSecret, userAgent } =
+    getRedditOAuthConfig();
+
+  const credentials = Buffer.from(
+    `${clientId}:${clientSecret}`
+  ).toString("base64");
+
+  const res = await fetchWithTimeout(
+    "https://www.reddit.com/api/v1/access_token",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${credentials}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": userAgent,
+      },
+      body: "grant_type=client_credentials",
+    }
+  );
+
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(
+      `Reddit OAuth failed: ${res.status} ${detail}`
+    );
+  }
+
+  const json = (await res.json()) as {
+    access_token?: string;
+    expires_in?: number;
+  };
+
+  if (!json.access_token) {
+    throw new Error("Reddit OAuth did not return an access token.");
+  }
+
+  const expiresInMs =
+    Math.max(60, json.expires_in ?? 3600) * 1000;
+
+  redditTokenCache = {
+    accessToken: json.access_token,
+    expiresAt: now + expiresInMs - 60_000,
+  };
+
+  return json.access_token;
+}
+
 async function fetchJson<T>(
   url: string,
-  errors: string[]
+  errors: string[],
+  headers?: HeadersInit
 ): Promise<T | null> {
   try {
-    const res = await fetchWithTimeout(url);
+    const res = await fetchWithTimeout(url, { headers });
 
     if (!res.ok) {
       errors.push(`Reddit returned ${res.status}: ${url}`);
@@ -584,9 +670,12 @@ function mapRedditPost(post: RedditPostData): RawRedditPost | null {
 
 async function fetchRedditUrl(
   url: string,
+  accessToken: string,
   errors: string[]
 ): Promise<RawRedditPost[]> {
-  const json = await fetchJson<RedditListing>(url, errors);
+  const json = await fetchJson<RedditListing>(url, errors, {
+    Authorization: `Bearer ${accessToken}`,
+  });
   const children = json?.data?.children ?? [];
 
   return children
@@ -596,37 +685,41 @@ async function fetchRedditUrl(
 
 async function fetchReddit() {
   const errors: string[] = [];
+  const accessToken = await getRedditAccessToken();
 
-  const subreddits = shuffle(REDDIT_SUBREDDITS).slice(0, 6);
-  const queries = shuffle(REDDIT_SEARCH_QUERIES).slice(0, 8);
+  const subreddits = shuffle(REDDIT_SUBREDDITS).slice(
+    0,
+    REDDIT_SUBREDDIT_LIMIT
+  );
+  const queries = shuffle(REDDIT_SEARCH_QUERIES).slice(
+    0,
+    REDDIT_SEARCH_LIMIT
+  );
 
   const urls: string[] = [];
 
   for (const subreddit of subreddits) {
-    urls.push(`https://www.reddit.com/r/${subreddit}/new.json?limit=20`);
-    urls.push(`https://www.reddit.com/r/${subreddit}/top.json?t=week&limit=20`);
+    urls.push(
+      `https://oauth.reddit.com/r/${subreddit}/new?limit=20&raw_json=1`
+    );
+    urls.push(
+      `https://oauth.reddit.com/r/${subreddit}/top?t=week&limit=20&raw_json=1`
+    );
   }
 
   for (const query of queries) {
     urls.push(
-      `https://www.reddit.com/search.json?q=${encodeURIComponent(
+      `https://oauth.reddit.com/search?q=${encodeURIComponent(
         query
-      )}&sort=new&t=month&limit=20`
+      )}&sort=new&t=month&limit=20&raw_json=1`
     );
   }
 
-  const settled = await Promise.allSettled(
-    urls.map((url) => fetchRedditUrl(url, errors))
-  );
+  const posts: RawRedditPost[] = [];
 
-  const posts = settled.flatMap((result, index) => {
-    if (result.status === "rejected") {
-      errors.push(`Reddit fetch failed: ${urls[index]}`);
-      return [];
-    }
-
-    return result.value;
-  });
+  for (const url of urls) {
+    posts.push(...(await fetchRedditUrl(url, accessToken, errors)));
+  }
 
   return { posts, errors };
 }
@@ -697,6 +790,7 @@ async function collectRedditPain(): Promise<AnalyzeResponse> {
       "Package results for WILL",
     ],
     debug: {
+      redditAuthEnabled: true,
       redditFetched: posts.length,
       afterDedupe: deduped.length,
       aiCandidates: candidates.length,
