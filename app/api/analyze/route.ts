@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 
+export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 type RawRedditPost = {
   id: string;
@@ -35,6 +37,7 @@ type AnalyzeResponse = {
   debug: {
     redditFetched: number;
     afterDedupe: number;
+    aiCandidates: number;
     rejected: number;
     errors: string[];
   };
@@ -52,11 +55,32 @@ type AiPainAnalysis = {
   tinyToolDirection?: string;
 };
 
-const USER_AGENT = "bd-reddit-pain-picker/5.2";
+type RedditPostData = {
+  id?: string;
+  subreddit?: string;
+  title?: string;
+  selftext?: string;
+  permalink?: string;
+  url?: string;
+  author?: string;
+  created_utc?: number;
+  score?: number;
+  num_comments?: number;
+};
+
+type RedditListing = {
+  data?: {
+    children?: Array<{
+      data?: RedditPostData;
+    }>;
+  };
+};
+
+const USER_AGENT = "bd-reddit-pain-picker/5.3";
 
 const RESULT_LIMIT = 10;
-const AI_CANDIDATE_LIMIT = 18;
-const FETCH_TIMEOUT_MS = 12000;
+const AI_CANDIDATE_LIMIT = 12;
+const FETCH_TIMEOUT_MS = 9000;
 const MIN_KEEP_SCORE = 7;
 
 const REDDIT_SUBREDDITS = [
@@ -73,7 +97,6 @@ const REDDIT_SUBREDDITS = [
   "ChatGPTPro",
   "ClaudeAI",
   "CreatorsAI",
-  "Quote_to_Cash",
 ];
 
 const REDDIT_SEARCH_QUERIES = [
@@ -93,9 +116,6 @@ const REDDIT_SEARCH_QUERIES = [
   '"client updates"',
   '"lead tracking"',
   '"missed follow ups"',
-  '"operations"',
-  '"SOP"',
-  '"process"',
   '"agency"',
   '"ads offline"',
   '"no one noticed"',
@@ -119,9 +139,6 @@ const OFF_TARGET_TERMS = [
   "interview",
   "hr got offended",
   "unpaid internship",
-  "share your project",
-  "share fever",
-  "drop your project",
 ];
 
 const WORKFLOW_TERMS = [
@@ -145,7 +162,7 @@ const WORKFLOW_TERMS = [
   "account",
   "updates",
   "status",
-  "SOP",
+  "sop",
   "process",
   "operations",
   "not managing",
@@ -153,15 +170,21 @@ const WORKFLOW_TERMS = [
   "missed",
   "wasted",
   "hours",
+  "page speed",
+  "pagespeed",
+  "lighthouse",
+  "frontend",
+  "cleanup",
+  "playbook",
 ];
 
-function normalizeWs(s: string) {
-  return s.replace(/\s+/g, " ").trim();
+function normalizeWs(value: string) {
+  return value.replace(/\s+/g, " ").trim();
 }
 
-function stripHtml(s: string) {
+function stripHtml(value: string) {
   return normalizeWs(
-    s
+    value
       .replace(/<[^>]+>/g, " ")
       .replace(/&amp;/g, "&")
       .replace(/&quot;/g, '"')
@@ -172,8 +195,8 @@ function stripHtml(s: string) {
   );
 }
 
-function truncate(s: string, max = 900) {
-  const clean = normalizeWs(s);
+function truncate(value: string, max = 900) {
+  const clean = normalizeWs(value);
 
   return clean.length > max
     ? `${clean.slice(0, max - 1)}…`
@@ -190,14 +213,16 @@ function safeString(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function lowerCombined(post: RawRedditPost | RedditPostData) {
-  return normalizeWs(
-    `${post.title ?? ""} ${"excerpt" in post ? post.excerpt : post.selftext ?? ""}`
-  ).toLowerCase();
+function lowerText(value: string) {
+  return normalizeWs(value).toLowerCase();
+}
+
+function combinedPostText(post: RawRedditPost) {
+  return lowerText(`${post.title} ${post.excerpt}`);
 }
 
 function isClearlyOffTarget(text: string) {
-  const lower = text.toLowerCase();
+  const lower = lowerText(text);
 
   return OFF_TARGET_TERMS.some((term) =>
     lower.includes(term.toLowerCase())
@@ -205,7 +230,7 @@ function isClearlyOffTarget(text: string) {
 }
 
 function hasWorkflowSignal(text: string) {
-  const lower = text.toLowerCase();
+  const lower = lowerText(text);
 
   return WORKFLOW_TERMS.some((term) =>
     lower.includes(term.toLowerCase())
@@ -257,7 +282,7 @@ function buildWillInput(post: RawRedditPost, analysis: AiPainAnalysis) {
     "- Keep it narrow.",
     "- Reduce manual work.",
     "- Make it fast to build.",
-    "- The output should be useful enough that a solo founder can build a first version this week.",
+    "- Make the first version useful for a solo founder this week.",
   ].join("\n");
 }
 
@@ -283,13 +308,12 @@ function validateAnalysis(post: RawRedditPost, analysis: AiPainAnalysis) {
   const score =
     typeof analysis.score === "number"
       ? analysis.score
-      : Number(analysis.score || 0);
+      : Number(analysis.score ?? 0);
 
   const usable = analysis.usable === true;
 
   const rejectReason =
-    safeString(analysis.rejectReason) ||
-    "Weak workflow signal.";
+    safeString(analysis.rejectReason) || "Weak workflow signal.";
 
   if (!usable) {
     throw new Error(`Rejected: ${rejectReason}`);
@@ -311,16 +335,13 @@ function validateAnalysis(post: RawRedditPost, analysis: AiPainAnalysis) {
     );
   }
 
-  const combined = lowerCombined(post);
-
-  if (isClearlyOffTarget(combined)) {
+  if (isClearlyOffTarget(combinedPostText(post))) {
     throw new Error("Rejected: off-target topic.");
   }
 }
 
 async function analyzePostWithAi(post: RawRedditPost): Promise<PainItem> {
   const apiKey = process.env.OPENAI_API_KEY;
-
   const model = process.env.BD_OPENAI_MODEL || "gpt-5.4-nano";
 
   if (!apiKey) {
@@ -332,8 +353,8 @@ async function analyzePostWithAi(post: RawRedditPost): Promise<PainItem> {
     "BD finds real workflow friction that can become a tiny AI/no-code tool.",
     "",
     "KEEP only if all are true:",
-    "1. A specific user/buyer has a repeated operational problem.",
-    "2. The pain involves manual work, tracking, reporting, follow-up, checking, spreadsheet work, client/account management, marketing ops, sales ops, creator ops, or business admin.",
+    "1. A specific user or buyer has a repeated operational problem.",
+    "2. The pain involves manual work, tracking, reporting, follow-up, checking, spreadsheets, client/account management, marketing ops, sales ops, creator ops, frontend cleanup, or business admin.",
     "3. There is a bad current workaround.",
     "4. A solo founder could build a narrow first version within one week.",
     "5. The output could become a useful tool, lead magnet, micro SaaS, automation, or paid service.",
@@ -345,8 +366,8 @@ async function analyzePostWithAi(post: RawRedditPost): Promise<PainItem> {
     "- generic motivation",
     "- adult/NSFW content",
     "- medical/health advice",
+    "- pure entertainment",
     "- a simple project showcase with no workflow pain",
-    "- a share-your-project thread unless the comments/data themselves create a clear extraction/tracking workflow",
     "- a viral story that cannot become a narrow operational tool",
     "",
     "Return JSON only.",
@@ -414,9 +435,7 @@ async function analyzePostWithAi(post: RawRedditPost): Promise<PainItem> {
   }
 
   const json = await res.json();
-
   const content = json.choices?.[0]?.message?.content || "";
-
   const analysis = extractJsonObject(content);
 
   validateAnalysis(post, analysis);
@@ -426,7 +445,8 @@ async function analyzePostWithAi(post: RawRedditPost): Promise<PainItem> {
     safeString(analysis.workflowFriction) ||
     post.title;
 
-  const workflowFriction = safeString(analysis.workflowFriction) || pain;
+  const workflowFriction =
+    safeString(analysis.workflowFriction) || pain;
 
   const targetUser =
     safeString(analysis.targetUser) ||
@@ -542,38 +562,29 @@ async function fetchWithTimeout(url: string, init?: RequestInit) {
   }
 }
 
-async function fetchJson<T>(url: string): Promise<T | null> {
+async function fetchJson<T>(
+  url: string,
+  errors: string[]
+): Promise<T | null> {
   try {
     const res = await fetchWithTimeout(url);
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      errors.push(`Reddit returned ${res.status}: ${url}`);
+      return null;
+    }
 
     return (await res.json()) as T;
-  } catch {
+  } catch (error) {
+    errors.push(
+      error instanceof Error
+        ? `Reddit fetch error: ${error.message} | ${url}`
+        : `Reddit fetch error: ${url}`
+    );
+
     return null;
   }
 }
-
-type RedditPostData = {
-  id?: string;
-  subreddit?: string;
-  title?: string;
-  selftext?: string;
-  permalink?: string;
-  url?: string;
-  author?: string;
-  created_utc?: number;
-  score?: number;
-  num_comments?: number;
-};
-
-type RedditListing = {
-  data?: {
-    children?: Array<{
-      data?: RedditPostData;
-    }>;
-  };
-};
 
 function mapRedditPost(post: RedditPostData): RawRedditPost | null {
   const title = normalizeWs(post.title ?? "");
@@ -584,13 +595,16 @@ function mapRedditPost(post: RedditPostData): RawRedditPost | null {
 
   const rawSelftext = normalizeWs(stripHtml(post.selftext ?? ""));
 
-  const excerpt = truncate(rawSelftext.length >= 40 ? rawSelftext : title, 900);
+  const excerpt = truncate(
+    rawSelftext.length >= 40 ? rawSelftext : title,
+    900
+  );
 
   if (!excerpt || excerpt.length < 12) {
     return null;
   }
 
-  const tempPost: RawRedditPost = {
+  const mapped: RawRedditPost = {
     id: post.id
       ? `reddit-${post.id}`
       : Math.random().toString(36).slice(2),
@@ -614,7 +628,7 @@ function mapRedditPost(post: RedditPostData): RawRedditPost | null {
     comments: post.num_comments,
   };
 
-  const combined = lowerCombined(tempPost);
+  const combined = combinedPostText(mapped);
 
   if (isClearlyOffTarget(combined)) {
     return null;
@@ -624,11 +638,14 @@ function mapRedditPost(post: RedditPostData): RawRedditPost | null {
     return null;
   }
 
-  return tempPost;
+  return mapped;
 }
 
-async function fetchRedditUrl(url: string): Promise<RawRedditPost[]> {
-  const json = await fetchJson<RedditListing>(url);
+async function fetchRedditUrl(
+  url: string,
+  errors: string[]
+): Promise<RawRedditPost[]> {
+  const json = await fetchJson<RedditListing>(url, errors);
 
   const children = json?.data?.children ?? [];
 
@@ -640,30 +657,31 @@ async function fetchRedditUrl(url: string): Promise<RawRedditPost[]> {
 async function fetchReddit() {
   const errors: string[] = [];
 
-  const subreddits = shuffle(REDDIT_SUBREDDITS).slice(0, 7);
-  const queries = shuffle(REDDIT_SEARCH_QUERIES).slice(0, 10);
+  const subreddits = shuffle(REDDIT_SUBREDDITS).slice(0, 6);
+  const queries = shuffle(REDDIT_SEARCH_QUERIES).slice(0, 8);
 
   const urls: string[] = [];
 
   for (const subreddit of subreddits) {
-    urls.push(`https://www.reddit.com/r/${subreddit}/new.json?limit=25`);
-    urls.push(`https://www.reddit.com/r/${subreddit}/top.json?t=week&limit=25`);
+    urls.push(`https://www.reddit.com/r/${subreddit}/new.json?limit=20`);
+    urls.push(`https://www.reddit.com/r/${subreddit}/top.json?t=week&limit=20`);
   }
 
   for (const query of queries) {
     urls.push(
       `https://www.reddit.com/search.json?q=${encodeURIComponent(
         query
-      )}&sort=new&t=month&limit=25`
+      )}&sort=new&t=month&limit=20`
     );
   }
 
-  const settled = await Promise.allSettled(urls.map(fetchRedditUrl));
+  const settled = await Promise.allSettled(
+    urls.map((url) => fetchRedditUrl(url, errors))
+  );
 
   const posts = settled.flatMap((result, index) => {
     if (result.status === "rejected") {
       errors.push(`Reddit fetch failed: ${urls[index]}`);
-
       return [];
     }
 
@@ -727,13 +745,15 @@ async function collectRedditPain(): Promise<AnalyzeResponse> {
     sources: ["Reddit"],
     pipeline: [
       "Fetch workflow friction",
+      "Show Reddit fetch errors in debug",
       "Reject weak or off-target posts",
-      "Find repeated manual work",
+      "Analyze limited candidates with AI",
       "Package strong signals for WILL",
     ],
     debug: {
       redditFetched: posts.length,
       afterDedupe: deduped.length,
+      aiCandidates: candidates.length,
       rejected: Math.max(0, candidates.length - analyzed.length),
       errors,
     },
@@ -743,6 +763,14 @@ async function collectRedditPain(): Promise<AnalyzeResponse> {
 export async function GET() {
   try {
     const result = await collectRedditPain();
+
+    console.log("BD GET /api/analyze result:", {
+      redditFetched: result.debug.redditFetched,
+      afterDedupe: result.debug.afterDedupe,
+      aiCandidates: result.debug.aiCandidates,
+      kept: result.kept,
+      errors: result.debug.errors.slice(0, 5),
+    });
 
     return NextResponse.json(result);
   } catch (error) {
@@ -779,15 +807,10 @@ export async function POST(request: Request) {
 
     const post: RawRedditPost = {
       id: "manual-input",
-
       subreddit: body.subreddit?.trim() || "manual",
-
       title: body.title?.trim() || "Manual pasted signal",
-
       url: body.url?.trim() || "manual-input",
-
       excerpt: sourceText,
-
       publishedAt: new Date().toISOString(),
     };
 

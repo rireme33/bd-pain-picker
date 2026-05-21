@@ -1,7 +1,9 @@
-node_modules
-.next
-.vercel
-.open-next
+﻿node_modules/
+.next/
+.vercel/
+.open-next/
 .env*
+.dev.vars
+*.local
 .DS_Store
 npm-debug.log*
