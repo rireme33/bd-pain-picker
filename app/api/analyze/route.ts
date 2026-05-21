@@ -40,11 +40,24 @@ type AnalyzeResponse = {
   };
 };
 
-const USER_AGENT =
-  "bd-reddit-pain-picker/5.0";
+type AiPainAnalysis = {
+  usable?: boolean;
+  score?: number;
+  rejectReason?: string;
+  targetUser?: string;
+  pain?: string;
+  workflowFriction?: string;
+  currentBadWorkaround?: string;
+  whyItMatters?: string;
+  tinyToolDirection?: string;
+};
+
+const USER_AGENT = "bd-reddit-pain-picker/5.2";
 
 const RESULT_LIMIT = 10;
+const AI_CANDIDATE_LIMIT = 18;
 const FETCH_TIMEOUT_MS = 12000;
+const MIN_KEEP_SCORE = 7;
 
 const REDDIT_SUBREDDITS = [
   "Entrepreneur",
@@ -67,17 +80,79 @@ const REDDIT_SEARCH_QUERIES = [
   '"manual work"',
   '"spreadsheet"',
   '"follow up"',
-  '"forgotten"',
   '"takes hours"',
   '"copy paste"',
   '"repetitive"',
   '"workflow"',
   '"tracking"',
   '"admin work"',
-  '"we built an internal tool"',
   '"hard to keep track"',
   '"I manually"',
   '"wasting hours"',
+  '"reporting"',
+  '"client updates"',
+  '"lead tracking"',
+  '"missed follow ups"',
+  '"operations"',
+  '"SOP"',
+  '"process"',
+  '"agency"',
+  '"ads offline"',
+  '"no one noticed"',
+];
+
+const OFF_TARGET_TERMS = [
+  "nsfw",
+  "adult",
+  "porn",
+  "xxx",
+  "dick",
+  "urologist",
+  "movie streaming",
+  "dating",
+  "relationship",
+  "loneliness",
+  "stabbed in the back",
+  "co-founder",
+  "cofounder",
+  "intern",
+  "interview",
+  "hr got offended",
+  "unpaid internship",
+  "share your project",
+  "share fever",
+  "drop your project",
+];
+
+const WORKFLOW_TERMS = [
+  "manual",
+  "spreadsheet",
+  "tracking",
+  "follow up",
+  "follow-up",
+  "copy paste",
+  "repetitive",
+  "workflow",
+  "admin",
+  "report",
+  "reporting",
+  "client",
+  "lead",
+  "leads",
+  "ads",
+  "campaign",
+  "agency",
+  "account",
+  "updates",
+  "status",
+  "SOP",
+  "process",
+  "operations",
+  "not managing",
+  "offline",
+  "missed",
+  "wasted",
+  "hours",
 ];
 
 function normalizeWs(s: string) {
@@ -111,32 +186,69 @@ function toIso(seconds?: number) {
     : undefined;
 }
 
-type AiPainAnalysis = {
-  usable: boolean;
-  targetUser: string;
-  pain: string;
-  workflowFriction: string;
-  currentBadWorkaround: string;
-  whyItMatters: string;
-  tinyToolDirection: string;
-};
+function safeString(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
 
-function buildWillInput(
-  post: RawRedditPost,
-  analysis: AiPainAnalysis
-) {
+function lowerCombined(post: RawRedditPost | RedditPostData) {
+  return normalizeWs(
+    `${post.title ?? ""} ${"excerpt" in post ? post.excerpt : post.selftext ?? ""}`
+  ).toLowerCase();
+}
+
+function isClearlyOffTarget(text: string) {
+  const lower = text.toLowerCase();
+
+  return OFF_TARGET_TERMS.some((term) =>
+    lower.includes(term.toLowerCase())
+  );
+}
+
+function hasWorkflowSignal(text: string) {
+  const lower = text.toLowerCase();
+
+  return WORKFLOW_TERMS.some((term) =>
+    lower.includes(term.toLowerCase())
+  );
+}
+
+function buildWillInput(post: RawRedditPost, analysis: AiPainAnalysis) {
+  const targetUser =
+    safeString(analysis.targetUser) ||
+    "Solo founders, operators, agencies, or small teams";
+
+  const pain =
+    safeString(analysis.pain) ||
+    safeString(analysis.workflowFriction) ||
+    post.title;
+
+  const workflowFriction =
+    safeString(analysis.workflowFriction) || pain;
+
+  const currentBadWorkaround =
+    safeString(analysis.currentBadWorkaround) ||
+    "Manual checking, spreadsheets, repeated copy-paste, ad-hoc follow-up, or messy reporting.";
+
+  const whyItMatters =
+    safeString(analysis.whyItMatters) ||
+    "This wastes time, creates missed opportunities, causes mistakes, or makes the workflow hard to scale.";
+
+  const tinyToolDirection =
+    safeString(analysis.tinyToolDirection) ||
+    "A tiny tool that turns this messy workflow into a repeatable output.";
+
   return [
     "A workflow friction signal was found.",
     "",
     `Source: r/${post.subreddit} — ${post.title}`,
     `URL: ${post.url}`,
     "",
-    `Target user: ${analysis.targetUser}`,
-    `Pain: ${analysis.pain}`,
-    `Workflow friction: ${analysis.workflowFriction}`,
-    `Current bad workaround: ${analysis.currentBadWorkaround}`,
-    `Why it matters: ${analysis.whyItMatters}`,
-    `Tiny tool direction: ${analysis.tinyToolDirection}`,
+    `Target user: ${targetUser}`,
+    `Pain: ${pain}`,
+    `Workflow friction: ${workflowFriction}`,
+    `Current bad workaround: ${currentBadWorkaround}`,
+    `Why it matters: ${whyItMatters}`,
+    `Tiny tool direction: ${tinyToolDirection}`,
     "",
     "Original source:",
     post.excerpt,
@@ -145,6 +257,7 @@ function buildWillInput(
     "- Keep it narrow.",
     "- Reduce manual work.",
     "- Make it fast to build.",
+    "- The output should be useful enough that a solo founder can build a first version this week.",
   ].join("\n");
 }
 
@@ -163,45 +276,96 @@ function extractJsonObject(text: string) {
     throw new Error("AI did not return JSON.");
   }
 
-  return JSON.parse(
-    cleaned.slice(start, end + 1)
-  ) as AiPainAnalysis;
+  return JSON.parse(cleaned.slice(start, end + 1)) as AiPainAnalysis;
 }
 
-async function analyzePostWithAi(
-  post: RawRedditPost
-): Promise<PainItem> {
+function validateAnalysis(post: RawRedditPost, analysis: AiPainAnalysis) {
+  const score =
+    typeof analysis.score === "number"
+      ? analysis.score
+      : Number(analysis.score || 0);
+
+  const usable = analysis.usable === true;
+
+  const rejectReason =
+    safeString(analysis.rejectReason) ||
+    "Weak workflow signal.";
+
+  if (!usable) {
+    throw new Error(`Rejected: ${rejectReason}`);
+  }
+
+  if (!Number.isFinite(score) || score < MIN_KEEP_SCORE) {
+    throw new Error(
+      `Rejected: score ${score || 0} below ${MIN_KEEP_SCORE}. ${rejectReason}`
+    );
+  }
+
+  const targetUser = safeString(analysis.targetUser);
+  const workflowFriction = safeString(analysis.workflowFriction);
+  const tinyToolDirection = safeString(analysis.tinyToolDirection);
+
+  if (!targetUser || !workflowFriction || !tinyToolDirection) {
+    throw new Error(
+      "Rejected: missing targetUser, workflowFriction, or tinyToolDirection."
+    );
+  }
+
+  const combined = lowerCombined(post);
+
+  if (isClearlyOffTarget(combined)) {
+    throw new Error("Rejected: off-target topic.");
+  }
+}
+
+async function analyzePostWithAi(post: RawRedditPost): Promise<PainItem> {
   const apiKey = process.env.OPENAI_API_KEY;
 
-  const model =
-    process.env.BD_OPENAI_MODEL ||
-    "gpt-5.4-nano";
+  const model = process.env.BD_OPENAI_MODEL || "gpt-5.4-nano";
 
   if (!apiKey) {
-    throw new Error(
-      "OPENAI_API_KEY is missing."
-    );
+    throw new Error("OPENAI_API_KEY is missing.");
   }
 
   const systemPrompt = [
     "You are BD.",
-    "Find workflow friction.",
-    "Find repeated manual work.",
-    "Find spreadsheet workflows.",
-    "Find repetitive operations.",
-    "Do NOT reject weak signals.",
-    "Return short JSON only.",
+    "BD finds real workflow friction that can become a tiny AI/no-code tool.",
+    "",
+    "KEEP only if all are true:",
+    "1. A specific user/buyer has a repeated operational problem.",
+    "2. The pain involves manual work, tracking, reporting, follow-up, checking, spreadsheet work, client/account management, marketing ops, sales ops, creator ops, or business admin.",
+    "3. There is a bad current workaround.",
+    "4. A solo founder could build a narrow first version within one week.",
+    "5. The output could become a useful tool, lead magnet, micro SaaS, automation, or paid service.",
+    "",
+    "REJECT if it is mainly:",
+    "- hiring drama",
+    "- founder drama",
+    "- relationship/life advice",
+    "- generic motivation",
+    "- adult/NSFW content",
+    "- medical/health advice",
+    "- a simple project showcase with no workflow pain",
+    "- a share-your-project thread unless the comments/data themselves create a clear extraction/tracking workflow",
+    "- a viral story that cannot become a narrow operational tool",
+    "",
+    "Return JSON only.",
+    "Be strict. Weak signals should be rejected.",
   ].join("\n");
 
   const userPrompt = [
     `Title: ${post.title}`,
     `Subreddit: ${post.subreddit}`,
+    `URL: ${post.url}`,
     "",
+    "Source text:",
     post.excerpt,
     "",
-    "Return JSON:",
+    "Return JSON in this exact shape:",
     JSON.stringify({
       usable: true,
+      score: 0,
+      rejectReason: "",
       targetUser: "",
       pain: "",
       workflowFriction: "",
@@ -209,91 +373,99 @@ async function analyzePostWithAi(
       whyItMatters: "",
       tinyToolDirection: "",
     }),
+    "",
+    "Scoring guide:",
+    "9-10 = obvious paid workflow pain with strong tool opportunity.",
+    "7-8 = usable workflow friction with a narrow buildable tool.",
+    "4-6 = interesting but weak, vague, or not clearly monetizable.",
+    "0-3 = off-topic, drama, showcase, entertainment, adult, medical, or not a workflow.",
   ].join("\n");
 
-  const res = await fetch(
-    "https://api.openai.com/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type":
-          "application/json",
-        Authorization: `Bearer ${apiKey}`,
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.1,
+      max_tokens: 320,
+      response_format: {
+        type: "json_object",
       },
-      body: JSON.stringify({
-        model,
-        temperature: 0.2,
-        max_tokens: 220,
-        response_format: {
-          type: "json_object",
+      messages: [
+        {
+          role: "system",
+          content: systemPrompt,
         },
-        messages: [
-          {
-            role: "system",
-            content: systemPrompt,
-          },
-          {
-            role: "user",
-            content: userPrompt,
-          },
-        ],
-      }),
-    }
-  );
+        {
+          role: "user",
+          content: userPrompt,
+        },
+      ],
+    }),
+  });
 
   if (!res.ok) {
     const detail = await res.text();
 
-    throw new Error(
-      `OpenAI failed: ${res.status} ${detail}`
-    );
+    throw new Error(`OpenAI failed: ${res.status} ${detail}`);
   }
 
   const json = await res.json();
 
-  const content =
-    json.choices?.[0]?.message
-      ?.content || "";
+  const content = json.choices?.[0]?.message?.content || "";
 
-  const analysis =
-    extractJsonObject(content);
+  const analysis = extractJsonObject(content);
+
+  validateAnalysis(post, analysis);
+
+  const pain =
+    safeString(analysis.pain) ||
+    safeString(analysis.workflowFriction) ||
+    post.title;
+
+  const workflowFriction = safeString(analysis.workflowFriction) || pain;
+
+  const targetUser =
+    safeString(analysis.targetUser) ||
+    "Solo founders, operators, agencies, or small teams";
+
+  const currentBadWorkaround =
+    safeString(analysis.currentBadWorkaround) ||
+    "Manual checking, spreadsheets, repeated copy-paste, ad-hoc follow-up, or messy reporting.";
+
+  const whyItMatters =
+    safeString(analysis.whyItMatters) ||
+    "This wastes time, creates mistakes, and makes the workflow harder to scale.";
+
+  const tinyToolDirection =
+    safeString(analysis.tinyToolDirection) ||
+    "A tiny tool that turns this messy workflow into one repeatable output.";
 
   return {
     ...post,
     keep: true,
-    painQuote:
-      String(
-        analysis.workflowFriction ||
-          analysis.pain ||
-          post.title
-      ) || "",
-
-    whoHasPain:
-      analysis.targetUser || "",
-
-    currentBadWorkaround:
-      analysis.currentBadWorkaround ||
-      "",
-
-    whyItHurts:
-      analysis.whyItMatters || "",
-
-    tinyToolOpportunity:
-      analysis.tinyToolDirection ||
-      "",
-
-    willInput: buildWillInput(
-      post,
-      analysis
-    ),
+    painQuote: workflowFriction,
+    whoHasPain: targetUser,
+    currentBadWorkaround,
+    whyItHurts: whyItMatters,
+    tinyToolOpportunity: tinyToolDirection,
+    willInput: buildWillInput(post, {
+      ...analysis,
+      targetUser,
+      pain,
+      workflowFriction,
+      currentBadWorkaround,
+      whyItMatters,
+      tinyToolDirection,
+    }),
   };
 }
 
-function dedupeByTitle<
-  T extends { title: string }
->(items: T[]) {
+function dedupeByTitle<T extends { title: string }>(items: T[]) {
   const seen = new Set<string>();
-
   const out: T[] = [];
 
   for (const item of items) {
@@ -305,22 +477,17 @@ function dedupeByTitle<
     );
 
     if (!key) continue;
-
     if (seen.has(key)) continue;
 
     seen.add(key);
-
     out.push(item);
   }
 
   return out;
 }
 
-function dedupeByPainQuote(
-  items: PainItem[]
-) {
+function dedupeByPainQuote(items: PainItem[]) {
   const seen = new Set<string>();
-
   const out: PainItem[] = [];
 
   for (const item of items) {
@@ -332,11 +499,9 @@ function dedupeByPainQuote(
     );
 
     if (!key) continue;
-
     if (seen.has(key)) continue;
 
     seen.add(key);
-
     out.push(item);
   }
 
@@ -346,45 +511,30 @@ function dedupeByPainQuote(
 function shuffle<T>(items: T[]) {
   const copy = [...items];
 
-  for (
-    let i = copy.length - 1;
-    i > 0;
-    i--
-  ) {
-    const j = Math.floor(
-      Math.random() * (i + 1)
-    );
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
 
-    [copy[i], copy[j]] = [
-      copy[j],
-      copy[i],
-    ];
+    [copy[i], copy[j]] = [copy[j], copy[i]];
   }
 
   return copy;
 }
 
-async function fetchWithTimeout(
-  url: string,
-  init?: RequestInit
-) {
-  const controller =
-    new AbortController();
+async function fetchWithTimeout(url: string, init?: RequestInit) {
+  const controller = new AbortController();
 
-  const timeout = setTimeout(
-    () => controller.abort(),
-    FETCH_TIMEOUT_MS
-  );
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  const headers = new Headers(init?.headers);
+
+  headers.set("User-Agent", USER_AGENT);
+  headers.set("Accept", "application/json,text/plain,*/*");
 
   try {
     return await fetch(url, {
       ...init,
       signal: controller.signal,
-      headers: {
-        "User-Agent": USER_AGENT,
-        Accept:
-          "application/json,text/plain,*/*",
-      },
+      headers,
       cache: "no-store",
     });
   } finally {
@@ -392,13 +542,9 @@ async function fetchWithTimeout(
   }
 }
 
-async function fetchJson<T>(
-  url: string
-): Promise<T | null> {
+async function fetchJson<T>(url: string): Promise<T | null> {
   try {
-    const res = await fetchWithTimeout(
-      url
-    );
+    const res = await fetchWithTimeout(url);
 
     if (!res.ok) return null;
 
@@ -429,50 +575,37 @@ type RedditListing = {
   };
 };
 
-function mapRedditPost(
-  post: RedditPostData
-): RawRedditPost | null {
-  const title = normalizeWs(
-    post.title ?? ""
-  );
+function mapRedditPost(post: RedditPostData): RawRedditPost | null {
+  const title = normalizeWs(post.title ?? "");
 
-  const excerpt = truncate(
-    normalizeWs(
-      stripHtml(post.selftext ?? "")
-    ),
-    900
-  );
-
-  if (!title || title.length < 12)
+  if (!title || title.length < 12) {
     return null;
+  }
 
-  if (!excerpt || excerpt.length < 40)
+  const rawSelftext = normalizeWs(stripHtml(post.selftext ?? ""));
+
+  const excerpt = truncate(rawSelftext.length >= 40 ? rawSelftext : title, 900);
+
+  if (!excerpt || excerpt.length < 12) {
     return null;
+  }
 
-  const permalink = post.permalink
-    ? `https://www.reddit.com${post.permalink}`
-    : post.url ??
-      "https://www.reddit.com/";
+  const tempPost: RawRedditPost = {
+    id: post.id
+      ? `reddit-${post.id}`
+      : Math.random().toString(36).slice(2),
 
-  return {
-    id:
-      `reddit-${post.id}` ||
-      Math.random()
-        .toString(36)
-        .slice(2),
-
-    subreddit:
-      post.subreddit || "unknown",
+    subreddit: post.subreddit || "unknown",
 
     title,
 
-    url: permalink,
+    url: post.permalink
+      ? `https://www.reddit.com${post.permalink}`
+      : post.url || "https://www.reddit.com/",
 
     author: post.author,
 
-    publishedAt: toIso(
-      post.created_utc
-    ),
+    publishedAt: toIso(post.created_utc),
 
     excerpt,
 
@@ -480,128 +613,128 @@ function mapRedditPost(
 
     comments: post.num_comments,
   };
+
+  const combined = lowerCombined(tempPost);
+
+  if (isClearlyOffTarget(combined)) {
+    return null;
+  }
+
+  if (!hasWorkflowSignal(combined)) {
+    return null;
+  }
+
+  return tempPost;
 }
 
-async function fetchRedditUrl(
-  url: string
-): Promise<RawRedditPost[]> {
-  const json =
-    await fetchJson<RedditListing>(
-      url
-    );
+async function fetchRedditUrl(url: string): Promise<RawRedditPost[]> {
+  const json = await fetchJson<RedditListing>(url);
 
-  const children =
-    json?.data?.children ?? [];
+  const children = json?.data?.children ?? [];
 
   return children
-    .map(
-      (child) =>
-        child.data &&
-        mapRedditPost(child.data)
-    )
+    .map((child) => child.data && mapRedditPost(child.data))
     .filter(Boolean) as RawRedditPost[];
 }
 
 async function fetchReddit() {
   const errors: string[] = [];
 
-  const subreddits = shuffle(
-    REDDIT_SUBREDDITS
-  ).slice(0, 7);
-
-  const queries = shuffle(
-    REDDIT_SEARCH_QUERIES
-  ).slice(0, 8);
+  const subreddits = shuffle(REDDIT_SUBREDDITS).slice(0, 7);
+  const queries = shuffle(REDDIT_SEARCH_QUERIES).slice(0, 10);
 
   const urls: string[] = [];
 
   for (const subreddit of subreddits) {
-    urls.push(
-      `https://www.reddit.com/r/${subreddit}/new.json?limit=20`
-    );
-
-    urls.push(
-      `https://www.reddit.com/r/${subreddit}/top.json?t=week&limit=20`
-    );
+    urls.push(`https://www.reddit.com/r/${subreddit}/new.json?limit=25`);
+    urls.push(`https://www.reddit.com/r/${subreddit}/top.json?t=week&limit=25`);
   }
 
   for (const query of queries) {
     urls.push(
       `https://www.reddit.com/search.json?q=${encodeURIComponent(
         query
-      )}&sort=new&t=month&limit=20`
+      )}&sort=new&t=month&limit=25`
     );
   }
 
-  const settled =
-    await Promise.allSettled(
-      urls.map(fetchRedditUrl)
-    );
+  const settled = await Promise.allSettled(urls.map(fetchRedditUrl));
 
-  const posts = settled.flatMap(
-    (result, index) => {
-      if (
-        result.status === "rejected"
-      ) {
-        errors.push(
-          `Reddit fetch failed: ${urls[index]}`
-        );
+  const posts = settled.flatMap((result, index) => {
+    if (result.status === "rejected") {
+      errors.push(`Reddit fetch failed: ${urls[index]}`);
 
-        return [];
-      }
-
-      return result.value;
+      return [];
     }
-  );
+
+    return result.value;
+  });
 
   return { posts, errors };
 }
 
 async function collectRedditPain(): Promise<AnalyzeResponse> {
-  const { posts, errors } =
-    await fetchReddit();
+  const { posts, errors } = await fetchReddit();
 
-  const deduped =
-    dedupeByTitle(posts);
+  const deduped = dedupeByTitle(posts);
 
-  const analyzed =
-    await Promise.all(
-      deduped.map(analyzePostWithAi)
+  const candidates = [...deduped]
+    .sort((a, b) => {
+      const aComments = a.comments || 0;
+      const bComments = b.comments || 0;
+
+      return bComments - aComments;
+    })
+    .slice(0, AI_CANDIDATE_LIMIT);
+
+  if (candidates.length > 0 && !process.env.OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY is missing.");
+  }
+
+  const settled = await Promise.allSettled(
+    candidates.map(analyzePostWithAi)
+  );
+
+  const analyzed = settled.flatMap((result) => {
+    if (result.status === "fulfilled") {
+      return [result.value];
+    }
+
+    errors.push(
+      result.reason instanceof Error
+        ? result.reason.message
+        : "AI analysis failed."
     );
 
-  const items =
-    dedupeByPainQuote(analyzed)
-      .sort((a, b) => {
-        const aComments =
-          a.comments || 0;
+    return [];
+  });
 
-        const bComments =
-          b.comments || 0;
+  const items = dedupeByPainQuote(analyzed)
+    .sort((a, b) => {
+      const aComments = a.comments || 0;
+      const bComments = b.comments || 0;
 
-        return (
-          bComments - aComments
-        );
-      })
-      .slice(0, RESULT_LIMIT);
+      return bComments - aComments;
+    })
+    .slice(0, RESULT_LIMIT);
 
   return {
     items,
     rejected: [],
-    collected_at:
-      new Date().toISOString(),
+    collected_at: new Date().toISOString(),
     scanned: deduped.length,
     kept: items.length,
     sources: ["Reddit"],
     pipeline: [
       "Fetch workflow friction",
+      "Reject weak or off-target posts",
       "Find repeated manual work",
-      "Package it for WILL",
+      "Package strong signals for WILL",
     ],
     debug: {
       redditFetched: posts.length,
-      afterDedupe:
-        deduped.length,
-      rejected: 0,
+      afterDedupe: deduped.length,
+      rejected: Math.max(0, candidates.length - analyzed.length),
       errors,
     },
   };
@@ -609,10 +742,12 @@ async function collectRedditPain(): Promise<AnalyzeResponse> {
 
 export async function GET() {
   try {
-    return NextResponse.json(
-      await collectRedditPain()
-    );
+    const result = await collectRedditPain();
+
+    return NextResponse.json(result);
   } catch (error) {
+    console.error("BD GET /api/analyze failed:", error);
+
     return NextResponse.json(
       {
         message:
@@ -625,58 +760,55 @@ export async function GET() {
   }
 }
 
-export async function POST(
-  request: Request
-) {
+export async function POST(request: Request) {
   try {
-    const body =
-      (await request.json()) as {
-        title?: string;
-        text?: string;
-        url?: string;
-        subreddit?: string;
-      };
+    const body = (await request.json()) as {
+      title?: string;
+      text?: string;
+      input?: string;
+      content?: string;
+      url?: string;
+      subreddit?: string;
+    };
+
+    const sourceText =
+      body.text?.trim() ||
+      body.input?.trim() ||
+      body.content?.trim() ||
+      "";
 
     const post: RawRedditPost = {
       id: "manual-input",
-      subreddit:
-        body.subreddit?.trim() ||
-        "manual",
 
-      title:
-        body.title?.trim() ||
-        "Manual pasted signal",
+      subreddit: body.subreddit?.trim() || "manual",
 
-      url:
-        body.url?.trim() ||
-        "manual-input",
+      title: body.title?.trim() || "Manual pasted signal",
 
-      excerpt:
-        body.text?.trim() || "",
+      url: body.url?.trim() || "manual-input",
 
-      publishedAt:
-        new Date().toISOString(),
+      excerpt: sourceText,
+
+      publishedAt: new Date().toISOString(),
     };
 
     if (post.excerpt.length < 20) {
       return NextResponse.json(
         {
-          message:
-            "Paste more source text.",
+          message: "Paste more source text.",
         },
         { status: 400 }
       );
     }
 
-    const result =
-      await analyzePostWithAi(post);
+    const result = await analyzePostWithAi(post);
 
     return NextResponse.json({
       item: result,
-      collected_at:
-        new Date().toISOString(),
+      collected_at: new Date().toISOString(),
     });
   } catch (error) {
+    console.error("BD POST /api/analyze failed:", error);
+
     return NextResponse.json(
       {
         message:
